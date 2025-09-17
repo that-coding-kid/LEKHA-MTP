@@ -31,16 +31,25 @@ model_long.to('cuda')
 # === 3. Define MLP for 5 attributes ===
 # Determine embedding dimensions (SBERT:768, SpanBERT:768, Longformer:768)
 input_dim = 768 + 768 +768  # Total: 2304
-# Simple 2-layer MLP
-mlp = nn.Sequential(
-    nn.Linear(input_dim, 512),
-    nn.ReLU(),
-    nn.Linear(512, 5)
-).to('cuda')
+def make_mlp(input_dim):
+    return nn.Sequential(
+        nn.Linear(input_dim, 512),
+        nn.ReLU(),
+        nn.Linear(512, 2)
+    ).to('cuda')
 
+mlps_name = ["helpfulness", "correctness", "coherence", "complexity", "verbosity"]
+
+mlp_helpfulness = make_mlp(input_dim)
+mlp_correctness = make_mlp(input_dim)
+mlp_coherence   = make_mlp(input_dim)
+mlp_complexity  = make_mlp(input_dim)
+mlp_verbosity   = make_mlp(input_dim)
+
+mlps = [mlp_helpfulness, mlp_correctness, mlp_coherence, mlp_complexity, mlp_verbosity]
 # Loss and optimizer
 criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(mlp.parameters(), lr=1e-4)
+optimizers = [torch.optim.Adam(mlp.parameters(), lr=1e-4) for mlp in mlps]
 
 # === 4. Helper function: compute concatenated embedding ===
 def embed_text(prompt, response):
@@ -76,13 +85,14 @@ class HelpSteerDataset(torch.utils.data.Dataset):
         item = self.data[idx]
         prompt = item["prompt"]
         response = item["response"]
-        # Attributes as a tensor of shape (5,)
-        attrs = torch.tensor([item["helpfulness"],
-                               item["correctness"],
-                               item["coherence"],
-                               item["complexity"],
-                               item["verbosity"]],
-                              dtype=torch.float)
+        # Each attribute as a float
+        attrs = [
+            torch.tensor(item["helpfulness"], dtype=torch.float),
+            torch.tensor(item["correctness"], dtype=torch.float),
+            torch.tensor(item["coherence"],   dtype=torch.float),
+            torch.tensor(item["complexity"],  dtype=torch.float),
+            torch.tensor(item["verbosity"],   dtype=torch.float)
+        ]
         return prompt, response, attrs
 
 train_data = HelpSteerDataset(train_ds)
@@ -92,38 +102,47 @@ train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
 val_loader   = DataLoader(val_data,   batch_size=32)
 
 # === 6. Training loop ===
-for epoch in range(15):  # example: 3 epochs
-    mlp.train()
-    total_loss = 0.0
-    for prompts, responses, labels in tqdm(train_loader, desc=f"Epoch {epoch}"):
-        optimizer.zero_grad()
+for epoch in range(15):
+    for mlp in mlps:
+        mlp.train()
+    total_losses = [0.0 for _ in range(5)]
+    for prompts, responses, labels_list in tqdm(train_loader, desc=f"Epoch {epoch}"):
         batch_embeddings = []
-        # Compute embeddings for each example in batch
         for p, r in zip(prompts, responses):
-            emb = embed_text(p, r)     # (1,2304)
+            emb = embed_text(p, r)
             batch_embeddings.append(emb)
         batch_embeddings = torch.cat(batch_embeddings, dim=0)  # (B, 2304)
-        labels = labels.to('cuda')  # (B,5)
-        preds = mlp(batch_embeddings)  # (B,5)
-        loss = criterion(preds, labels)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    print(f"Epoch {epoch}: Train loss = {total_loss/len(train_loader):.4f}")
 
-    # (Optional) Evaluate on validation set similarly
-    mlp.eval()
-    val_loss = 0.0
+        # Each attribute label: shape (B,)
+        for i, (mlp, optimizer) in enumerate(zip(mlps, optimizers)):
+            optimizer.zero_grad()
+            labels = torch.stack([labels[i] for labels in labels_list]).to('cuda')  # (B,)
+            # Expand labels to shape (B,2) for MSELoss (dummy second value, e.g. repeat)
+            labels_2d = labels.unsqueeze(1).repeat(1,2)  # (B,2)
+            preds = mlp(batch_embeddings)  # (B,2)
+            loss = criterion(preds, labels_2d)
+            loss.backward()
+            optimizer.step()
+            total_losses[i] += loss.item()
+    print(f"Epoch {epoch}: Train losses = {[l/len(train_loader) for l in total_losses]}")
+
+    # Validation
+    for mlp in mlps:
+        mlp.eval()
+    val_losses = [0.0 for _ in range(5)]
     with torch.no_grad():
-        for prompts, responses, labels in tqdm(val_loader, desc=f"Val Epoch {epoch}"):
+        for prompts, responses, labels_list in tqdm(val_loader, desc=f"Val Epoch {epoch}"):
             batch_embeddings = []
             for p, r in zip(prompts, responses):
                 emb = embed_text(p, r)
                 batch_embeddings.append(emb)
             batch_embeddings = torch.cat(batch_embeddings, dim=0)
-            labels = labels.to('cuda')
-            preds = mlp(batch_embeddings)
-            val_loss += criterion(preds, labels).item()
-    print(f"Epoch {epoch}: Validation loss = {val_loss/len(val_loader):.4f}")
-    # Save model checkpoint
-    torch.save(mlp.state_dict(), f"attribute_mlp_epoch{epoch}.pth")
+            for i, mlp in enumerate(mlps):
+                labels = torch.stack([labels[i] for labels in labels_list]).to('cuda')
+                labels_2d = labels.unsqueeze(1).repeat(1,2)
+                preds = mlp(batch_embeddings)
+                val_losses[i] += criterion(preds, labels_2d).item()
+    print(f"Epoch {epoch}: Validation losses = {[l/len(val_loader) for l in val_losses]}")
+    # Save model checkpoints
+    for i, mlp in enumerate(mlps):
+        torch.save(mlp.state_dict(), f"attribute_mlp_{mlps_name[i]}_epoch{epoch}.pth")
